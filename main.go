@@ -1,29 +1,33 @@
+// Copyright 2015 The Syncato Authors.  All rights reserved.
+// Use of this source code is governed by a AGPL
+// license that can be found in the LICENSE file.
+
+// Package main defines the syncato daemon. This daemon is reponsible for
+// serving the APIs and the frontend applications.
 package main
 
 import (
-	"github.com/julienschmidt/httprouter"
-	"github.com/syncato/syncato-api/filesapi"
-	"golang.org/x/net/context"
-	"net/http"
-)
-
-import (
-	"code.google.com/p/go-uuid/uuid"
 	"fmt"
-	"github.com/Sirupsen/logrus"
-	"github.com/syncato/syncato-lib/auth/jsonauth"
-	"github.com/syncato/syncato-lib/auth/muxauth"
-	"github.com/syncato/syncato-lib/config"
-	"github.com/syncato/syncato-lib/logger"
-	"github.com/syncato/syncato-lib/storage/localstorage"
-	"github.com/syncato/syncato-lib/storage/muxstorage"
+	"net/http"
 	"os"
-)
 
-var APIRoutes = make(map[string]map[string]map[string]func(ctx context.Context, w http.ResponseWriter, r *http.Request))
+	apiauth "github.com/syncato/apis/auth"
+	apifiles "github.com/syncato/apis/files"
+	apimux "github.com/syncato/lib/api/mux"
+	authmux "github.com/syncato/lib/auth/mux"
+	authjson "github.com/syncato/lib/auth/providers/json"
+	config "github.com/syncato/lib/config"
+	logger "github.com/syncato/lib/logger"
+	storagemux "github.com/syncato/lib/storage/mux"
+	storagelocal "github.com/syncato/lib/storage/providers/local"
+
+	"code.google.com/p/go-uuid/uuid"
+	"github.com/Sirupsen/logrus"
+	"github.com/julienschmidt/httprouter"
+	"golang.org/x/net/context"
+)
 
 func main() {
-
 	// We parse the options from the command line
 	opts, err := getServerOptions()
 	if err != nil {
@@ -32,6 +36,7 @@ func main() {
 	}
 
 	if opts.createconfig == true {
+		err = createConfigFile(opts.config)
 		if err != nil {
 			logrus.WithFields(logrus.Fields{"server": "main.go", "err": err}).Error("error creating custom configuration file")
 			os.Exit(1)
@@ -40,9 +45,19 @@ func main() {
 	}
 
 	router := httprouter.New()
-	router.Handle("GET", "/api/:id/:op/*path", handleRequest(opts))
+	router.Handle("GET", "/*catchall", handleRequest(opts))
+	router.Handle("POST", "/*catchall", handleRequest(opts))
+	router.Handle("PUT", "/*catchall", handleRequest(opts))
+	router.Handle("DELETE", "/*catchall", handleRequest(opts))
+	router.Handle("OPTIONS", "/*catchall", handleRequest(opts))
+	router.Handle("HEAD", "/*catchall", handleRequest(opts))
 
-	http.ListenAndServe(fmt.Sprintf(":%d", opts.port), router)
+	fmt.Println("Listening at port ", opts.port)
+	err = http.ListenAndServe(fmt.Sprintf(":%d", opts.port), router)
+	if err != nil {
+		fmt.Println("error listening: ", err)
+		os.Exit(1)
+	}
 
 }
 
@@ -59,15 +74,19 @@ func handleRequest(opts *Options) httprouter.Handle {
 		}()
 
 		// This config provider instance give us access to the configuration file
-		cp, err := config.NewConfigProvider(opts.config, log)
+		cfg, err := config.New(opts.config, log)
 		if err != nil {
 			logrus.WithFields(logrus.Fields{"server": "main.go", "err": err}).Error("error creating config provider")
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 
+		/***************************
+		 ** AUTH BACKENDS **********
+		****************************/
+
 		// This is an instance of the JSON file based authentication
-		jsonAuth, err := jsonauth.NewJSONAuth("json", cp, log)
+		authJSON, err := authjson.NewAuthJSON("json", cfg, log)
 		if err != nil {
 			log.Error(err, nil)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -75,7 +94,7 @@ func handleRequest(opts *Options) httprouter.Handle {
 		}
 
 		// This is the instance of the authentication multiplexer
-		authMux, err := muxauth.NewMuxAuth(cp, log)
+		authMux, err := authmux.NewAuthMux(cfg, log)
 		if err != nil {
 			log.Error(err, nil)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -83,15 +102,19 @@ func handleRequest(opts *Options) httprouter.Handle {
 		}
 
 		// We register the JSON auth file based authentication to be used by the auth mux
-		err = authMux.RegisterAuthProvider(jsonAuth)
+		err = authMux.RegisterAuthProvider(authJSON)
 		if err != nil {
 			log.Error(err, nil)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 
+		/******************************
+		 ** STORAGE BACKENDS **********
+		 ******************************/
+
 		// This is an instance of the storages we are going to use
-		localStorage, err := localstorage.NewLocalStorage("local", cp, log)
+		storageLocal, err := storagelocal.NewStorageLocal("local", cfg, log)
 		if err != nil {
 			log.Error(err, nil)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -99,60 +122,39 @@ func handleRequest(opts *Options) httprouter.Handle {
 		}
 
 		// This is an instance of the storage multiplexer
-		storageMux, err := muxstorage.NewMuxStorage(log)
+		storageMux, err := storagemux.NewStorageMux(log)
 
 		// We register the local storage inside our storage mux
-		err = storageMux.RegisterStorage(localStorage)
+		err = storageMux.AddStorageProvider(storageLocal)
 		if err != nil {
 			log.Error(err, nil)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
 
+		/***************************
+		 ** REQ CONTEXT **********
+		****************************/
+
 		// This is the root context passed to all requests
 		rootCtx := context.Background()
 		ctx := context.WithValue(rootCtx, "log", log)
 		ctx = context.WithValue(ctx, "authMux", authMux)
 		ctx = context.WithValue(ctx, "storageMux", storageMux)
-		ctx = context.WithValue(ctx, "cp", cp)
+		ctx = context.WithValue(ctx, "cfg", cfg)
 
-		// We get the API information based on the path
-		//apiID := params.ByName("id")
-		//path := params.ByName("path")
+		/*******************
+		 ** APIS  **********
+		********************/
+		//filesAPI := filesapi.NewFilesAPI("files")
+		apiAuth := apiauth.NewAPIAuth("auth")
+		apiFiles := apifiles.NewAPIFiles("files")
+		apiMux, _ := apimux.NewAPIMux(log)
+		apiMux.RegisterApi(apiAuth)
+		apiMux.RegisterApi(apiFiles)
 
-		// We load our apis
-		//filesAPI := filesapi.NewFilesAPI()
-		//filesAPI
-		/*
-			path := params.ByName("path")
-			if strings.HasPrefix(path, "/api/files/") {
-				filesapi.HandleRequest(ctx, w, r)
-			} else {
-				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-				return
-			}
-		*/
-		filesAPI := filesapi.NewFilesAPI()
-		op := filesAPI.GetOps()[0]
-		log.Info("op", map[string]interface{}{"op": op})
-		op.Execute(ctx, w, r)
+		apiMux.HandleRequest(ctx, w, r)
 
 	}
 	return fn
 }
-
-/*
-// parse return API information
-// All APIs are reached trought the pattern
-// "/api/:api_name/:api_operation/:api_path"
-// Given a clean URL after splitting by "/" we should get at minimum 5 parts
-func parse(url string) (string, error) {
-	parts := strings.Split(path, "/")
-	if len(parts) < 5 {
-		return "", errors.New("path does not match any API")
-	}
-	path := strings.Join(parts[1:], sep)
-	toret := strings.Join(a, sep)
-}
-
-*/
